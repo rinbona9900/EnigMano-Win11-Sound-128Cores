@@ -43,7 +43,7 @@ jobs:
         id: resolve
         env:
           PROFILE: ${{ github.event.inputs.RUNNER_PROFILE }}
-          MAP_URL: ${{ vars.MYSTRASIGIL_RUNNER_MAP_URL }}
+          MAP_URL: "https://gitlab.com/ShahzaibYT/test/-/raw/main/mystraSIGIL-runner-map.json"
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
@@ -68,7 +68,7 @@ jobs:
           $selectedProfile = "$($env:PROFILE)"
           $mapUrl = "$($env:MAP_URL)"
           if ([string]::IsNullOrWhiteSpace($mapUrl)) {
-            throw "Repository variable MYSTRASIGIL_RUNNER_MAP_URL is empty. Set it to your hosted GitLab raw JSON URL."
+            throw "MAP_URL is empty. Set a valid hosted GitLab raw JSON URL in the workflow."
           }
 
           try {
