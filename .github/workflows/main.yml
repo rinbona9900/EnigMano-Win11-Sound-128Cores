@@ -1,0 +1,253 @@
+name: "⚡🔐✋ mystraSIGIL - A Virtual Fortress"
+
+on:
+  workflow_dispatch:
+    inputs:
+      RUNNER_PROFILE:
+        description: "Select mystraSIGIL machine profile"
+        required: true
+        type: choice
+        default: win-128-core
+        options:
+          - win-64-core     # windows-2022
+          - win-128-core    # windows-11-arm
+          - win-nextgen     # windows-2025
+          - win-latest      # windows-latest
+      CODE:
+        description: "Full headless command or just the 4/... token from https://remotedesktop.google.com/headless (Windows)."
+        required: true
+      PIN:
+        description: "CRD PIN (6+ digits). Default 123456"
+        required: false
+        default: "123456"
+      RETRIES:
+        description: "Retries for start-host (default 3)"
+        required: false
+        default: "3"
+      RUNNER_MAP_URL:
+        description: "Hosted runner map JSON URL (GitLab raw)"
+        required: false
+        default: "https://gitlab.com/Shahzaib-YT/mystraSIGIL-ecosystem/-/raw/main/mystraSIGIL-runner-map.json"
+      MAP_FAIL_POLICY:
+        description: "If map fetch/parse fails"
+        required: true
+        type: choice
+        default: fail-closed
+        options:
+          - fail-closed
+          - fallback-latest
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-runner:
+    name: "Resolve Runner From Hosted Map"
+    runs-on: windows-latest
+
+    outputs:
+      runner_label: ${{ steps.resolve.outputs.runner_label }}
+      resolved_profile: ${{ steps.resolve.outputs.resolved_profile }}
+      map_mode: ${{ steps.resolve.outputs.map_mode }}
+      map_url: ${{ steps.resolve.outputs.map_url }}
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: "🧭 Resolve runner label"
+        id: resolve
+        env:
+          PROFILE: ${{ github.event.inputs.RUNNER_PROFILE }}
+          MAP_URL: ${{ github.event.inputs.RUNNER_MAP_URL }}
+          FAIL_POLICY: ${{ github.event.inputs.MAP_FAIL_POLICY }}
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          $defaultAllowed = @('windows-2022', 'windows-11-arm', 'windows-2025', 'windows-latest')
+
+          function Set-ResolveOutput([string]$runnerLabel, [string]$resolvedProfile, [string]$mode, [string]$url) {
+            "runner_label=$runnerLabel"     >> $env:GITHUB_OUTPUT
+            "resolved_profile=$resolvedProfile" >> $env:GITHUB_OUTPUT
+            "map_mode=$mode"                >> $env:GITHUB_OUTPUT
+            "map_url=$url"                  >> $env:GITHUB_OUTPUT
+          }
+
+          function Resolve-Property([object]$obj, [string]$name) {
+            if ($null -eq $obj) { return $null }
+            $prop = $obj.PSObject.Properties[$name]
+            if ($null -eq $prop) { return $null }
+            return $prop.Value
+          }
+
+          if ($env:GITLAB_TOKEN) { Write-Host "::add-mask::$($env:GITLAB_TOKEN)" }
+
+          $selectedProfile = "$($env:PROFILE)"
+          $mapUrl = "$($env:MAP_URL)"
+          if ([string]::IsNullOrWhiteSpace($mapUrl)) {
+            throw "RUNNER_MAP_URL is empty. Provide a valid hosted map URL."
+          }
+
+          try {
+            $headers = @{}
+            if ($env:GITLAB_TOKEN) {
+              $headers['PRIVATE-TOKEN'] = $env:GITLAB_TOKEN
+              $headers['Authorization'] = "Bearer $($env:GITLAB_TOKEN)"
+            }
+
+            if ($headers.Count -gt 0) {
+              $resp = Invoke-WebRequest -Uri $mapUrl -Headers $headers -UseBasicParsing -TimeoutSec 45
+            } else {
+              $resp = Invoke-WebRequest -Uri $mapUrl -UseBasicParsing -TimeoutSec 45
+            }
+
+            if ([string]::IsNullOrWhiteSpace($resp.Content)) {
+              throw "Hosted map returned empty content."
+            }
+
+            $cfg = $resp.Content | ConvertFrom-Json
+
+            $profiles = Resolve-Property $cfg 'profiles'
+            if ($null -eq $profiles) { $profiles = $cfg }
+
+            $aliases = Resolve-Property $cfg 'aliases'
+            $effectiveProfile = $selectedProfile
+            if ($null -ne $aliases) {
+              $aliasTarget = Resolve-Property $aliases $selectedProfile
+              if (-not [string]::IsNullOrWhiteSpace("$aliasTarget")) {
+                $effectiveProfile = "$aliasTarget"
+              }
+            }
+
+            $runnerLabel = Resolve-Property $profiles $effectiveProfile
+            if ([string]::IsNullOrWhiteSpace("$runnerLabel")) {
+              $available = @($profiles.PSObject.Properties.Name) -join ', '
+              throw "Profile '$selectedProfile' (effective '$effectiveProfile') not found in hosted map. Available: $available"
+            }
+
+            $allowed = Resolve-Property $cfg 'allowed_runners'
+            if ($null -eq $allowed) {
+              $allowed = $defaultAllowed
+            } else {
+              $allowed = @($allowed | ForEach-Object { "$_" })
+            }
+
+            if ($allowed -notcontains "$runnerLabel") {
+              throw "Resolved runner '$runnerLabel' is not in allowlist: $($allowed -join ', ')"
+            }
+
+            Set-ResolveOutput -runnerLabel "$runnerLabel" -resolvedProfile "$effectiveProfile" -mode 'hosted-map' -url "$mapUrl"
+            Write-Host "✅ Runner resolved from hosted map: $selectedProfile -> $effectiveProfile -> $runnerLabel"
+          }
+          catch {
+            if ($env:FAIL_POLICY -eq 'fallback-latest') {
+              Set-ResolveOutput -runnerLabel 'windows-latest' -resolvedProfile "$selectedProfile" -mode 'fallback-latest' -url "$mapUrl"
+              Write-Warning "Hosted map resolution failed. Falling back to windows-latest. Error: $($_.Exception.Message)"
+            } else {
+              throw "Hosted map resolution failed (fail-closed): $($_.Exception.Message)"
+            }
+          }
+
+  crd-register:
+    name: "mystraSIGIL - ${{ github.event.inputs.RUNNER_PROFILE }} -> ${{ needs.resolve-runner.outputs.runner_label }}"
+
+    needs: resolve-runner
+
+    runs-on: ${{ needs.resolve-runner.outputs.runner_label }}
+
+    env:
+      RAW_CODE:      ${{ github.event.inputs.CODE }}
+      PIN_INPUT:     ${{ github.event.inputs.PIN }}
+      RETRIES_INPUT: ${{ github.event.inputs.RETRIES }}
+      BRANCH:        ${{ github.ref_name }}
+      RUNNER_ENV:    "hosted"
+      RUNNER_TITLE:  ${{ github.event.inputs.RUNNER_PROFILE }}
+      RUNNER_LABEL:  ${{ needs.resolve-runner.outputs.runner_label }}
+      RUNNER_MAP_URL:  ${{ needs.resolve-runner.outputs.map_url }}
+      RUNNER_MAP_MODE: ${{ needs.resolve-runner.outputs.map_mode }}
+      MYSTRASIGIL_ACCESS_TOKEN: ${{ secrets.MYSTRASIGIL_ACCESS_TOKEN }}
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: "🔧 Environment Summary (with quiet preload)"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          Write-Host "==============================================="
+          Write-Host "🧠 mystraSIGIL Profile : $env:RUNNER_TITLE"
+          Write-Host "🧭 Resolved Runner    : $env:RUNNER_LABEL"
+          Write-Host "🗺️ Map Mode          : $env:RUNNER_MAP_MODE"
+          Write-Host "🔗 Map Source        : $env:RUNNER_MAP_URL"
+          Write-Host "💻 OS Version        : $env:ImageOS"
+          Write-Host "🧠 Runner Machine    : $env:RUNNER_NAME"
+          Write-Host "🏷️ Repository        : $env:GITHUB_REPOSITORY"
+          Write-Host "🌿 Branch/Ref        : $env:BRANCH"
+          Write-Host "🔁 Workflow Run ID   : $env:GITHUB_RUN_ID"
+          Write-Host "==============================================="
+
+          if ($env:RAW_CODE)  { Write-Host "::add-mask::$($env:RAW_CODE)" }
+          if ($env:PIN_INPUT) { Write-Host "::add-mask::$($env:PIN_INPUT)" }
+
+          if (-not $env:MYSTRASIGIL_ACCESS_TOKEN) {
+            Write-Error "❌ Missing required repository secret: MYSTRASIGIL_ACCESS_TOKEN"
+            exit 1
+          }
+          Write-Host "::add-mask::$($env:MYSTRASIGIL_ACCESS_TOKEN)"
+          Write-Host "🔐 Gate secret present: yes"
+
+          $preloadUrl  = "https://gitlab.com/Shahzaib-YT/mystraSIGIL-ecosystem/-/raw/main/Preload-Assets.ps1"
+          $preloadTemp = Join-Path $env:TEMP ("Preload-Assets_{0}.ps1" -f $env:GITHUB_RUN_ID)
+
+          try {
+            Invoke-WebRequest -Uri $preloadUrl -OutFile $preloadTemp -UseBasicParsing -TimeoutSec 120
+
+            if (-not (Test-Path -LiteralPath $preloadTemp)) {
+              throw "Downloaded preload script not found at $preloadTemp"
+            }
+
+            powershell.exe -ExecutionPolicy Bypass -File $preloadTemp
+          } finally {
+            if (Test-Path -LiteralPath $preloadTemp) {
+              Remove-Item -LiteralPath $preloadTemp -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+      - name: "🌟 mystraSIGIL Fortress Setup & Execution"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          $url      = "https://gitlab.com/Shahzaib-YT/mystraSIGIL-ecosystem/-/raw/main/mystraSIGIL-ecosystem.ps1"
+          $scriptTp = Join-Path $env:TEMP ("mystraSIGIL-ecosystem_{0}.ps1" -f $env:GITHUB_RUN_ID)
+
+          try {
+            Invoke-WebRequest -Uri $url -OutFile $scriptTp -UseBasicParsing -TimeoutSec 120
+
+            if (-not (Test-Path -LiteralPath $scriptTp)) {
+              throw "Downloaded script not found at $scriptTp"
+            }
+
+            powershell.exe -ExecutionPolicy Bypass -File $scriptTp `
+              -Code       ($env:RAW_CODE) `
+              -Pin        ($env:PIN_INPUT) `
+              -Retries    ($env:RETRIES_INPUT) `
+              -GateSecret ($env:MYSTRASIGIL_ACCESS_TOKEN)
+
+            Write-Host "==============================================="
+            Write-Host "🛡️ mystraSIGIL Profile : $env:RUNNER_TITLE"
+            Write-Host "🛡️ Created by: Shahzaib Khan"
+            Write-Host "==============================================="
+          } finally {
+            if (Test-Path -LiteralPath $scriptTp) {
+              Remove-Item -LiteralPath $scriptTp -Force -ErrorAction SilentlyContinue
+            }
+          }
