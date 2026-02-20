@@ -4,10 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       RUNNER_PROFILE:
-        description: "Profile key from hosted runner map (example: win-128-core)"
+        description: "Select mystraSIGIL machine profile"
         required: true
-        type: string
+        type: choice
         default: win-128-core
+        options:
+          - win-64-core
+          - win-128-core
+          - win-nextgen
+          - win-latest
       CODE:
         description: "Full headless command or just the 4/... token from https://remotedesktop.google.com/headless (Windows)."
         required: true
@@ -25,14 +30,11 @@ permissions:
 
 jobs:
   resolve-runner:
-    name: "Resolve Runner From Hosted Map"
+    name: "Bootstrap"
     runs-on: windows-latest
 
     outputs:
       runner_label: ${{ steps.resolve.outputs.runner_label }}
-      resolved_profile: ${{ steps.resolve.outputs.resolved_profile }}
-      map_mode: ${{ steps.resolve.outputs.map_mode }}
-      map_url: ${{ steps.resolve.outputs.map_url }}
 
     defaults:
       run:
@@ -49,11 +51,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-          function Set-ResolveOutput([string]$runnerLabel, [string]$resolvedProfile, [string]$mode, [string]$url) {
+          function Set-ResolveOutput([string]$runnerLabel) {
             "runner_label=$runnerLabel"     >> $env:GITHUB_OUTPUT
-            "resolved_profile=$resolvedProfile" >> $env:GITHUB_OUTPUT
-            "map_mode=$mode"                >> $env:GITHUB_OUTPUT
-            "map_url=$url"                  >> $env:GITHUB_OUTPUT
           }
 
           function Resolve-Property([object]$obj, [string]$name) {
@@ -130,15 +129,14 @@ jobs:
               throw "Resolved runner '$runnerLabel' is not in allowlist: $($allowed -join ', ')"
             }
 
-            Set-ResolveOutput -runnerLabel "$runnerLabel" -resolvedProfile "$effectiveProfile" -mode 'hosted-map' -url "$mapUrl"
-            Write-Host "✅ Runner resolved from hosted map: $selectedProfile -> $effectiveProfile -> $runnerLabel"
+            Set-ResolveOutput -runnerLabel "$runnerLabel"
           }
           catch {
             throw "Hosted map resolution failed (fail-closed): $($_.Exception.Message)"
           }
 
   crd-register:
-    name: "mystraSIGIL - ${{ github.event.inputs.RUNNER_PROFILE }} -> ${{ needs.resolve-runner.outputs.runner_label }}"
+    name: "mystraSIGIL - ${{ github.event.inputs.RUNNER_PROFILE }}"
 
     needs: resolve-runner
 
@@ -151,9 +149,6 @@ jobs:
       BRANCH:        ${{ github.ref_name }}
       RUNNER_ENV:    "hosted"
       RUNNER_TITLE:  ${{ github.event.inputs.RUNNER_PROFILE }}
-      RUNNER_LABEL:  ${{ needs.resolve-runner.outputs.runner_label }}
-      RUNNER_MAP_URL:  ${{ needs.resolve-runner.outputs.map_url }}
-      RUNNER_MAP_MODE: ${{ needs.resolve-runner.outputs.map_mode }}
       MYSTRASIGIL_ACCESS_TOKEN: ${{ secrets.MYSTRASIGIL_ACCESS_TOKEN }}
 
     defaults:
@@ -161,23 +156,11 @@ jobs:
         shell: pwsh
 
     steps:
-      - name: "🔧 Environment Summary (with quiet preload)"
+      - name: "🔧 Preload & Validate"
         run: |
           $ErrorActionPreference = 'Stop'
           $ProgressPreference = 'SilentlyContinue'
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-          Write-Host "==============================================="
-          Write-Host "🧠 mystraSIGIL Profile : $env:RUNNER_TITLE"
-          Write-Host "🧭 Resolved Runner    : $env:RUNNER_LABEL"
-          Write-Host "🗺️ Map Mode          : $env:RUNNER_MAP_MODE"
-          Write-Host "🔗 Map Source        : $env:RUNNER_MAP_URL"
-          Write-Host "💻 OS Version        : $env:ImageOS"
-          Write-Host "🧠 Runner Machine    : $env:RUNNER_NAME"
-          Write-Host "🏷️ Repository        : $env:GITHUB_REPOSITORY"
-          Write-Host "🌿 Branch/Ref        : $env:BRANCH"
-          Write-Host "🔁 Workflow Run ID   : $env:GITHUB_RUN_ID"
-          Write-Host "==============================================="
 
           if ($env:RAW_CODE)  { Write-Host "::add-mask::$($env:RAW_CODE)" }
           if ($env:PIN_INPUT) { Write-Host "::add-mask::$($env:PIN_INPUT)" }
@@ -228,10 +211,6 @@ jobs:
               -Retries    ($env:RETRIES_INPUT) `
               -GateSecret ($env:MYSTRASIGIL_ACCESS_TOKEN)
 
-            Write-Host "==============================================="
-            Write-Host "🛡️ mystraSIGIL Profile : $env:RUNNER_TITLE"
-            Write-Host "🛡️ Created by: Shahzaib Khan"
-            Write-Host "==============================================="
           } finally {
             if (Test-Path -LiteralPath $scriptTp) {
               Remove-Item -LiteralPath $scriptTp -Force -ErrorAction SilentlyContinue
